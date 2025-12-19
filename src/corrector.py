@@ -1,5 +1,5 @@
-from classGrid import Grid
-from classProjector import Projector
+from src.classGrid import Grid
+from src.classProjector import Projector
 import numpy as np  
 import scipy as sp
 

@@ -1,6 +1,3 @@
-from classProjector import Projector
-from classImage import Image
-from classRegion import Region
 import skimage                   
 from multiprocessing import Pool 
 import concurrent.futures
@@ -13,6 +10,10 @@ import re
 from pathlib import Path
 from PIL import Image as PILImage
 from scipy.ndimage import map_coordinates 
+
+from src.classProjector import Projector
+from src.classImage import Image
+from src.classRegion import Region
 
 
 def SetGlobalHorizontalShift(im0, im1, l):

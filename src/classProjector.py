@@ -98,31 +98,24 @@ class Projector:
         return Xold,Yold 
     
     def Plot(self, size):
-        x = np.arange(size[0])
-        y = np.arange(size[1])
-        X,Y = np.meshgrid(x,y,indexing='ij')
-        xtot = X.ravel() 
-        ytot = Y.ravel() 
-    
-        Pxtot,Pytot = self.P(xtot, ytot)
-    
-        plt.figure()
-        plt.imshow(Pxtot.reshape(X.shape)-X,cmap='RdBu')
-        cbar = plt.colorbar() 
-        plt.xticks(fontsize=20)
-        plt.yticks(fontsize=20)
-        cbar.ax.tick_params(labelsize=20) 
-        plt.axis('equal')
-        plt.title('Vertical distortion')
-        
-        plt.figure()
-        plt.imshow(Pytot.reshape(Y.shape)-Y,cmap='RdBu')
-        cbar = plt.colorbar() 
-        plt.xticks(fontsize=20)
-        plt.yticks(fontsize=20)
-        cbar.ax.tick_params(labelsize=20)
-        plt.axis('equal')
-        plt.title('Horizontal distortion')
+        X,Y = np.meshgrid(np.arange(size[0]), np.arange(size[1]), indexing='ij')
+        Pxtot,Pytot = self.P(X.ravel(), Y.ravel())
+
+        _, ax = plt.subplots(1, 2, figsize=(10, 3.65))
+        ax=ax.ravel()
+
+        v = np.max(np.abs([Pxtot.reshape(X.shape)-X, Pytot.reshape(Y.shape)-Y]))
+
+        ax0_im = ax[0].imshow(Pxtot.reshape(X.shape)-X,
+                              cmap='RdBu', vmin=-v, vmax=v)
+        ax1_im = ax[1].imshow(Pytot.reshape(Y.shape)-Y,
+                              cmap='RdBu', vmin=-v, vmax=v)
+
+        plt.colorbar(ax0_im, ax=ax[0], label='Vertical distortion (pixels)') 
+        plt.colorbar(ax1_im, ax=ax[1], label='Horizontal distortion (pixels)')   
+
+        for axs in ax:
+            axs.axis('equal')
 
 
     def PlotInverse(self,size):

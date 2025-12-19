@@ -1,11 +1,12 @@
-from classBilinearInterpolator import BiLinearRegularGridInterpolator 
 import scipy.interpolate as spi
 import cv2 as cv
 from   scipy.ndimage import gaussian_filter, spline_filter
 import numpy as np 
 import PIL.Image as image
 import matplotlib.pyplot as plt 
-import os  
+import os
+
+from src.classBilinearInterpolator import BiLinearRegularGridInterpolator 
 
 class Image:
     def __init__(self, fname):

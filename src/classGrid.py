@@ -6,7 +6,8 @@ import matplotlib.pyplot as plt
 import numpy as np 
 import skimage
 import pathlib
-import datetime 
+import datetime
+from scipy.ndimage import map_coordinates 
 
 
 def SetGlobalHorizontalShift(im0, im1, l):
@@ -143,8 +144,59 @@ class Grid:
         # plt.imshow(A)
         for im in self.images:
             im.PlotBox(origin,color)  
+
     
-    def StitchImages(self, cam=None, origin=(0,0), eps=(0,0), fusion_mode='average'):
+    def _process_blending_region(self, im, camc, xs_flat, ys_flat, origin, windowExt, sx_ims, sy_ims, sx_max, sy_max, ims, ws, is_overlap_fn, weight_fn):
+        """Helper for linear blending (reduces code duplication)"""
+        im_tx, im_ty = im.tx, im.ty
+        
+        imin = max(0, int(np.floor(im_tx + origin[0] - windowExt[0])))
+        imax = min(sx_ims - 1, int(np.ceil(im_tx + origin[0] + self.sx + windowExt[0])))
+        jmin = max(0, int(np.floor(im_ty + origin[1] - windowExt[1])))
+        jmax = min(sy_ims - 1, int(np.ceil(im_ty + origin[1] + self.sy + windowExt[1])))
+        
+        # Early exit if no overlap
+        if imin > imax or jmin > jmax:
+            return
+        
+        mask = (xs_flat >= imin) & (xs_flat <= imax) & (ys_flat >= jmin) & (ys_flat <= jmax)
+        idx_window = np.where(mask)[0]
+        
+        if len(idx_window) == 0:
+            return
+        
+        u, v = camc.P(xs_flat[idx_window] - origin[0] - im_tx,
+                      ys_flat[idx_window] - origin[1] - im_ty)
+        
+        fov_mask = (u >= 0) & (u <= sx_max) & (v >= 0) & (v <= sy_max)
+        idx_fov = idx_window[fov_mask]
+        
+        if len(idx_fov) == 0:
+            return
+        
+        u_fov, v_fov = u[fov_mask], v[fov_mask]
+        
+        # Separate overlapping and non-overlapping regions
+        mask_overlap = is_overlap_fn(u_fov, v_fov)
+
+        # Use cached spline-filtered pixels when available to avoid per-call prefiltering
+        pix_src = im.pix_prefiltered if getattr(im, "pix_prefiltered", None) is not None else im.pix
+
+        # Non-overlapping region (full weight)
+        mask_no = ~mask_overlap
+        if np.any(mask_no):
+            idx_no = idx_fov[mask_no]
+            ws[idx_no] += 1
+            ims[idx_no] += map_coordinates(pix_src, [u_fov[mask_no], v_fov[mask_no]], order=3, mode='constant', cval=0, prefilter=False)
+        
+        # Overlapping region with blending weight
+        if np.any(mask_overlap):
+            idx_o = idx_fov[mask_overlap]
+            w = weight_fn(u_fov[mask_overlap], v_fov[mask_overlap])
+            ws[idx_o] += w
+            ims[idx_o] += map_coordinates(pix_src, [u_fov[mask_overlap], v_fov[mask_overlap]], order=3, mode='constant', cval=0, prefilter=False) * w
+    
+    def StitchImages(self, cam=None, origin=(0,0), eps=(0,0), fusion_mode='linear blending'):
         """
         Stitch the grid into one image 
         """
@@ -157,241 +209,82 @@ class Grid:
             
         for r in self.regions: 
             r.SetBounds(epsilon=0) 
-        if fusion_mode == 'average': 
-            # Size of the fused image 
-            sx_ims = int(self.sx*self.nx - (self.nx-1)*np.floor(self.sx*self.ox/100))+eps[0]
-            sy_ims = int(self.sy*self.ny - (self.ny-1)*np.floor(self.sy*self.oy/100))+eps[1] 
-            # Discretize all the image domain 
-            X,Y = np.meshgrid( np.arange(sx_ims),  np.arange(sy_ims), indexing='ij' )
-            x = X.ravel() 
-            y = Y.ravel() 
-            ns = len(x)
-            # Creating empty image and the average weights 
-            ims = np.zeros(sx_ims*sy_ims)
-            ws = np.zeros(ns)
-            print('Fusing images (average):')
-            for k, im in enumerate(self.images):
-                ProgressBar(100 * (k+1) / len(self.images))
-                # print(k,end=',')
-                
-                # Restrict the FOV test only on a region (for faster calculation)
-                windowExt = [10,10]
-                imin  =  np.maximum(0, np.floor(im.tx+origin[0]-windowExt[0]) ) 
-                imax  =  np.minimum(sx_ims-1 , np.ceil(im.tx+origin[0]+im.pix.shape[0]+windowExt[0])  )
-                jmin  =  np.maximum(0, np.floor(im.ty+origin[1]-windowExt[1]) )
-                jmax  =  np.minimum(sy_ims-1 , np.ceil(im.ty+origin[1]+im.pix.shape[1]+windowExt[1]) ) 
-                I,J = np.meshgrid(np.arange(imin,imax+1),np.arange(jmin,jmax+1),indexing='ij')
-                indexI = I.ravel() 
-                indexJ = J.ravel() 
-                index1 = (indexJ + indexI*X.shape[1]).astype('int')
-                # Add the contribution of the sub-image to the total image 
-                u,v      = camc.P( x[index1]-origin[0]-im.tx, y[index1]-origin[1]-im.ty )
-                fov1 =  ((u >= 0)*(u<= im.pix.shape[0]-1 )*(v >= 0)*(v<=im.pix.shape[1]-1)).astype('int')
-                index2   = np.where(fov1==1)[0] # Points that are in the field of view 
-                fov      = index1[index2] 
-                ws[fov]  += 1
-                ims[fov] += im.Interp(u[index2], v[index2])   # Image 
-            #mask = np.copy(ws); mask[mask>0] = 1
-            ws[ws==0] = 1
-            ims = ims/ws 
-            print('\n')
-            return ims.reshape((sx_ims,sy_ims)) 
+
+        # Ensure each image has a cached spline-filtered version for fast map_coordinates
+        for im in self.images:
+            if getattr(im, "pix_prefiltered", None) is None:
+                im.BuildSplinePrefilter(order=3)
+        
+        # Compute fused image size once
+        sx_ims = int(self.sx*self.nx - (self.nx-1)*np.floor(self.sx*self.ox/100))+eps[0]
+        sy_ims = int(self.sy*self.ny - (self.ny-1)*np.floor(self.sy*self.oy/100))+eps[1]
+        
+        # Pre-compute coordinate grids once (shared by both fusion modes)
+        xs, ys = np.meshgrid(np.arange(sx_ims), np.arange(sy_ims), indexing='ij')
+        xs_flat = xs.ravel()
+        ys_flat = ys.ravel()
+        
+        ims = np.zeros(sx_ims*sy_ims)
+        ws = np.zeros(sx_ims*sy_ims)
+        windowExt = np.array([10, 10])
         
         if fusion_mode == 'linear blending':
-            # Size of the fused image 
-            sx_ims = int(self.sx*self.nx - (self.nx-1)*np.floor(self.sx*self.ox/100))+eps[0]
-            sy_ims = int(self.sy*self.ny - (self.ny-1)*np.floor(self.sy*self.oy/100))+eps[1] 
-            # Discretize all the image domain 
-            X,Y = np.meshgrid( np.arange(sx_ims),  np.arange(sy_ims), indexing='ij' )
-            x = X.ravel() 
-            y = Y.ravel() 
-            ns = len(x)
-            # Creating empty image and the average weights 
-            ims = np.zeros(sx_ims*sy_ims)
-            ws  = np.zeros(ns)
+            # Cache boundary values to avoid repeated computation
+            sx_max = self.sx - 1
+            sy_max = self.sy - 1
+            
             print('Fusing images (linear blending):')
             for k, r in enumerate(self.regions):
                 ProgressBar(100 * (k+1) / len(self.regions))
                 if r.type == 'v':
-                    """ Left image im0 """ 
-                    windowExt = [10,10]
-                    imin  =  np.maximum(0, np.floor(r.im0.tx+origin[0]-windowExt[0]) ) 
-                    imax  =  np.minimum(sx_ims-1 , np.ceil(r.im0.tx + origin[0] + self.sx + windowExt[0])  )
-                    jmin  =  np.maximum(0, np.floor(r.im0.ty + origin[1] - windowExt[1]) )
-                    jmax  =  np.minimum(sy_ims-1 , np.ceil(r.im0.ty + origin[1] + self.sy + windowExt[1]) ) 
-                    I,J = np.meshgrid(np.arange(imin,imax+1),np.arange(jmin,jmax+1),indexing='ij')
-                    indexI = I.ravel() 
-                    indexJ = J.ravel() 
-                    index0 = (indexJ + indexI*X.shape[1]).astype('int')
-                    u, v        = camc.P( x[index0]-origin[0]-r.im0.tx, y[index0]-origin[1]-r.im0.ty )
-                    fov1        =  ((u >= 0)*(u<= self.sx-1 )*(v >= 0)*(v<=self.sy-1)).astype('int')
-                    index1      = np.where(fov1==1)[0]
-                    fov2        = ((v[index1]>=0)*(v[index1]<=self.sy-1-r.hy)).astype('int')
-                    index2_o    = np.where(fov2==0)[0]  # Overlapping region  
-                    index2_no   = np.where(fov2==1)[0]  # Non overlapping region  
-                    fov_o       =  index1[index2_o] 
-                    fov_no      =  index1[index2_no] 
-                    w           =  ( v[fov_o] - (self.sy-1) ) / (-r.hy)  # Decreasing weighting 
-                    ws[index0[fov_no]]  +=  1
-                    ims[index0[fov_no]] +=  r.im0.Interp(u[fov_no],v[fov_no]) 
-                    ws[index0[fov_o]]   +=  w 
-                    ims[index0[fov_o]]  +=  r.im0.Interp(u[fov_o],v[fov_o]) * w 
+                    # Vertical regions: blending on v coordinate
+                    r_hy = r.hy  # Extract to avoid lambda closure issues
                     
-                    # plt.figure() 
-                    # plt.imshow(r.im0.pix, cmap='gray')
-                    # plt.plot(v[fov_no], u[fov_no], '.', markersize=2, color='red')
-                    # plt.plot(v[fov_o], u[fov_o], '.', markersize=2, color='green')
+                    # Left image im0 (decreasing weight with v)
+                    self._process_blending_region(
+                        r.im0, camc, xs_flat, ys_flat, origin, windowExt, 
+                        sx_ims, sy_ims, sx_max, sy_max, ims, ws,
+                        is_overlap_fn=lambda u, v, hy=r_hy, sy=sy_max: v > sy - hy,
+                        weight_fn=lambda u, v, hy=r_hy, sy=sy_max: (v - sy) / (-hy)
+                    )
                     
-                    # ws[ws==0] = 1
-                    # ims = ims/ws
-                    # plt.figure()
-                    # plt.imshow( ims.reshape((sx_ims,sy_ims)), cmap='gray' )
- 
-                    # raise ValueError('Stop debug')
-                    
-                    """ Right image  im1"""  
-                    windowExt = [10,10]
-                    imin  =  np.maximum(0, np.floor(r.im1.tx+origin[0]-windowExt[0]) ) 
-                    imax  =  np.minimum(sx_ims-1 , np.ceil(r.im1.tx + origin[0] + self.sx + windowExt[0])  )
-                    jmin  =  np.maximum(0, np.floor(r.im1.ty + origin[1] - windowExt[1]) )
-                    jmax  =  np.minimum(sy_ims-1 , np.ceil(r.im1.ty + origin[1] + self.sy + windowExt[1]) ) 
-                    I,J = np.meshgrid(np.arange(imin,imax+1),np.arange(jmin,jmax+1),indexing='ij')
-                    indexI = I.ravel() 
-                    indexJ = J.ravel() 
-                    index0 = (indexJ + indexI*X.shape[1]).astype('int')
-                    u, v   = camc.P( x[index0]-origin[0]-r.im1.tx, y[index0]-origin[1]-r.im1.ty )
-                    fov1   =  ((u >= 0)*(u<= self.sx-1 )*(v >= 0)*(v<=self.sy-1)).astype('int')
-                    index1 = np.where(fov1==1)[0]
-                    fov2   = ((v[index1]>=0)*(v[index1]<=r.hy)).astype('int')
-                    index2_o  = np.where(fov2==1)[0] # Overlapping region  
-                    index2_no = np.where(fov2==0)[0] # Non overlapping region 
-                    fov_o       =  index1[index2_o] 
-                    fov_no      =  index1[index2_no] 
-                    w           =  ( v[fov_o] ) / (r.hy)     # Increasing weighting 
-                    ws[index0[fov_no]]  +=  1
-                    ims[index0[fov_no]] +=  r.im1.Interp(u[fov_no],v[fov_no]) 
-                    ws[index0[fov_o]]   +=  w 
-                    ims[index0[fov_o]]  +=  r.im1.Interp(u[fov_o],v[fov_o]) * w 
-                    
-                    
-                    # plt.figure() 
-                    # plt.imshow(r.im1.pix, cmap='gray')
-                    # plt.plot(v[fov_no], u[fov_no], '.', markersize=2, color='red')
-                    # plt.plot(v[fov_o], u[fov_o], '.', markersize=2, color='green')
-                    
-                    # ws[ws==0] = 1
-                    # ims = ims/ws
-                    # plt.figure()
-                    # plt.imshow( ims.reshape((sx_ims,sy_ims)), cmap='gray' )
-                    
-                    # raise ValueError('Stop debug')
-                    
+                    # Right image im1 (increasing weight with v)
+                    self._process_blending_region(
+                        r.im1, camc, xs_flat, ys_flat, origin, windowExt,
+                        sx_ims, sy_ims, sx_max, sy_max, ims, ws,
+                        is_overlap_fn=lambda u, v, hy=r_hy: v <= hy,
+                        weight_fn=lambda u, v, hy=r_hy: v / hy
+                    )
                     
                 elif r.type == 'h':
-                    """ Top image im0 """ 
-                    windowExt = [10,10]
-                    imin  =  np.maximum(0, np.floor(r.im0.tx+origin[0]-windowExt[0]) ) 
-                    imax  =  np.minimum(sx_ims-1 , np.ceil(r.im0.tx + origin[0] + self.sx + windowExt[0])  )
-                    jmin  =  np.maximum(0, np.floor(r.im0.ty + origin[1] - windowExt[1]) )
-                    jmax  =  np.minimum(sy_ims-1 , np.ceil(r.im0.ty + origin[1] + self.sy + windowExt[1]) ) 
-                    I,J = np.meshgrid(np.arange(imin,imax+1),np.arange(jmin,jmax+1),indexing='ij')
-                    indexI = I.ravel() 
-                    indexJ = J.ravel() 
-                    index0 = (indexJ + indexI*X.shape[1]).astype('int')
-                    u, v       = camc.P( x[index0]-origin[0]-r.im0.tx, y[index0]-origin[1]-r.im0.ty )
-                    fov1       =  ((u >= 0)*(u<= self.sx-1 )*(v >= 0)*(v<=self.sy-1)).astype('int')
-                    index1      = np.where(fov1==1)[0]
-                    fov2        = ((u[index1]>=0)*(u[index1]<=self.sx-1-r.hx)).astype('int')
-                    index2_o    = np.where(fov2==0)[0]  # Overlapping region  
-                    index2_no   = np.where(fov2==1)[0]  # Non overlapping region  
-                    fov_o       =  index1[index2_o] 
-                    fov_no      =  index1[index2_no] 
-                    w           =  ( u[fov_o] - (self.sx-1) ) / (-r.hx)  # Decreasing weighting 
-                    ws[index0[fov_no]]  +=  1
-                    ims[index0[fov_no]] +=  r.im0.Interp(u[fov_no],v[fov_no]) 
-                    ws[index0[fov_o]]   +=  w 
-                    ims[index0[fov_o]]  +=  r.im0.Interp(u[fov_o],v[fov_o]) * w 
-                    """ Bottom image im1"""  
-                    windowExt = [10,10]
-                    imin  =  np.maximum(0, np.floor(r.im1.tx+origin[0]-windowExt[0]) ) 
-                    imax  =  np.minimum(sx_ims-1 , np.ceil(r.im1.tx + origin[0] + self.sx + windowExt[0])  )
-                    jmin  =  np.maximum(0, np.floor(r.im1.ty + origin[1] - windowExt[1]) )
-                    jmax  =  np.minimum(sy_ims-1 , np.ceil(r.im1.ty + origin[1] + self.sy + windowExt[1]) ) 
-                    I,J = np.meshgrid(np.arange(imin,imax+1),np.arange(jmin,jmax+1),indexing='ij')
-                    indexI = I.ravel() 
-                    indexJ = J.ravel() 
-                    index0 = (indexJ + indexI*X.shape[1]).astype('int')
-                    u, v   = camc.P( x[index0]-origin[0]-r.im1.tx, y[index0]-origin[1]-r.im1.ty )
-                    fov1   =  ((u >= 0)*(u<= self.sx-1 )*(v >= 0)*(v<=self.sy-1)).astype('int')
-                    index1 = np.where(fov1==1)[0]
-                    fov2   = ((u[index1]>=0)*(u[index1]<=r.hx)).astype('int')
-                    index2_o  = np.where(fov2==1)[0] # Overlapping region  
-                    index2_no = np.where(fov2==0)[0] # Non overlapping region 
-                    fov_o       =  index1[index2_o] 
-                    fov_no      =  index1[index2_no] 
-                    w           =  ( u[fov_o] ) / (r.hx)     # Increasing weighting 
-                    ws[index0[fov_no]]  +=  1
-                    ims[index0[fov_no]] +=  r.im1.Interp(u[fov_no],v[fov_no]) 
-                    ws[index0[fov_o]]   +=  w 
-                    ims[index0[fov_o]]  +=  r.im1.Interp(u[fov_o],v[fov_o]) * w 
+                    # Horizontal regions: blending on u coordinate
+                    r_hx = r.hx  # Extract to avoid lambda closure issues
+                    
+                    # Top image im0 (decreasing weight with u)
+                    self._process_blending_region(
+                        r.im0, camc, xs_flat, ys_flat, origin, windowExt,
+                        sx_ims, sy_ims, sx_max, sy_max, ims, ws,
+                        is_overlap_fn=lambda u, v, hx=r_hx, sx=sx_max: u > sx - hx,
+                        weight_fn=lambda u, v, hx=r_hx, sx=sx_max: (u - sx) / (-hx)
+                    )
+                    
+                    # Bottom image im1 (increasing weight with u)
+                    self._process_blending_region(
+                        r.im1, camc, xs_flat, ys_flat, origin, windowExt,
+                        sx_ims, sy_ims, sx_max, sy_max, ims, ws,
+                        is_overlap_fn=lambda u, v, hx=r_hx: u <= hx,
+                        weight_fn=lambda u, v, hx=r_hx: u / hx
+                    )
                 else:
                     raise ValueError('Unknown region type')
-            ws[ws==0] = 1
-            ims = ims/ws 
+            
+            ws[ws == 0] = 1
+            ims = ims / ws
             print('\n')
-            # plt.figure()
-            # plt.imshow(ws.reshape(sx_ims,sy_ims))
-            return ims.reshape((sx_ims,sy_ims)) 
+            return ims.reshape((sx_ims, sy_ims)) 
 
         else:
             raise ValueError('Unknown blending method')
-                
-                
-            
-         
-        # Map each image in the reference coordinate system related to the first 
-        # image with the offset origin 
-        
- 
-        
-        # for k, im in enumerate(self.images):
-        #     print('Image '+str(k))
-            
-        #     xmin = im.tx  + origin[0] ;  xmax =  im.tx + im.pix.shape[0] + origin[0]
-        #     ymin = im.ty  + origin[1] ;  ymax =  im.ty + im.pix.shape[1] + origin[1]
-            
-        #     xmin = int(np.round(xmin)) ;  xmax = int(np.round(xmax))
-        #     ymin = int(np.round(ymin)) ;  ymax = int(np.round(ymax))
-            
-        #     X,Y = np.meshgrid( np.arange( xmin, xmax ) , np.arange( ymin, ymax ) ,indexing='ij')
-        #     i = X.ravel() 
-        #     j = Y.ravel() 
-
-        #     Xim,Yim = np.meshgrid(np.arange(self.sx),np.arange(self.sy),indexing='ij')
-        #     u = Xim.ravel() 
-        #     v = Yim.ravel() 
-        #     Px,Py = cam.P(u,v)
-            
-        #     ims[i,j] =  im.Interp(Px,Py)
-        
-        # return ims 
-    
-    # def GetOpsParallel(self,cam):
-        
-    #     def local_assembly(r,cam):
-    #         return r.GetOps(cam)
-        
-    #     with Pool() as pool:
-    #         results = pool.map(local_assembly, [(self.regions[i],cam) for i in range(len((self.regions))) ] ) 
-    #         print('Results')
-    #         print(results)
-    #         for r in results:
-    #             print(r.get())
-    #         # for H,b,res in results: 
-    #         #     # print(H,b,res)
-    #         #     print('')
-        
-    #     return 
     
     def local_assembly(self,r,cam):
         """
@@ -403,7 +296,7 @@ class Grid:
         """
         Returns the Gauss-Newton side members 
         """
-        # t1 = datetime.datetime.now() 
+        import os
         nd   = len(cam.p)  # Number of distortion parameters 
         nImages = len(self.images)
         ndof = nd + 2*nImages
@@ -411,39 +304,20 @@ class Grid:
         b   = np.zeros(ndof)
         res_tot = [None]*len(self.regions)
         arnd = np.arange(nd)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=100) as executor :
-            processes = [ executor.submit(self.local_assembly, self.regions[i], cam) for i in range(len((self.regions)))  ]
-        for i, p in enumerate(processes):
-            r = self.regions[i]
-            Hl,bl,resl =   p.result()
-            rep  =  np.concatenate((arnd, self.conn[r.index_im0,:], self.conn[r.index_im1,:])) 
-            repk =  np.ix_(rep,rep)
-            H[repk] +=  Hl
-            b[rep]  +=  bl   
-            res_tot[i]  = resl
-        # print( "Time ", datetime.datetime.now() - t1 )  
-        return H,b,res_tot   
-    
-    # def GetOps(self,cam):
-    #     t1 = datetime.datetime.now() 
+        # Precompute connectivity per region to avoid repeated concat
+        region_conn = [np.concatenate((arnd, self.conn[r.index_im0,:], self.conn[r.index_im1,:]))
+                       for r in self.regions]
 
-    #     # Global DOF vector ; [a1,....,an,tx0,ty0,tx1,ty1,...,txn,tyn]
-    #     nd   = len(cam.p)  # Number of distortion parameters 
-    #     nImages = len(self.images)
-    #     ndof = nd + 2*nImages
-    #     H   = np.zeros((ndof,ndof))
-    #     b   = np.zeros(ndof)
-    #     res_tot = [None]*len(self.regions)
-    #     arnd = np.arange(nd)
-    #     for i,r in enumerate(self.regions):
-    #         Hl,bl,resl =   r.GetOps(cam)
-    #         rep  =  np.concatenate((arnd, self.conn[r.index_im0,:], self.conn[r.index_im1,:])) 
-    #         repk =  np.ix_(rep,rep)
-    #         H[repk] +=  Hl
-    #         b[rep]  +=  bl   
-    #         res_tot[i]  = resl
-    #     print( "Time ", datetime.datetime.now() - t1 )  
-    #     return H,b,res_tot   
+        max_workers = min(len(self.regions), max(1, os.cpu_count() or 1))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for i, (r, result) in enumerate(zip(self.regions, executor.map(self.local_assembly, self.regions, [cam]*len(self.regions)))):
+                Hl, bl, resl = result
+                rep = region_conn[i]
+                repk = np.ix_(rep, rep)
+                H[repk] += Hl
+                b[rep]  += bl
+                res_tot[i] = resl
+        return H, b, res_tot   
     
     def PlotResidualMap(self,res_list, epsImage = 10):
         """
@@ -484,45 +358,23 @@ class Grid:
         
         lx = int( np.floor(alphax * self.sx * self.ox / 100) ) 
         ly = int( np.floor(alphay * self.sy * self.oy / 100) )  
-  
         
-        # Loop over images and 
-        # Set global translations 
-        # For the image stitching 
-        for i in range(self.nx):
-            # Loop over a row 
-            # If even row, indices increase 
-            print("Row "+str(i))
-            
-            if i != 0 : 
-                if i%2 == 0: 
-                    j1 =  self.ny -1  
-                    a1 =  j1  + (i-1) * self.ny 
-                    j2 =  0 
-                    a2 =  j2  + i * self.ny  
-                    print("**Comparing the images %d %d " %(a1,a2)) 
-                    SetGlobalVerticalShift(self.images[a1], self.images[a2], lx)
-                else: 
-                    j1 =  0  
-                    a1 =  j1  + (i-1) * self.ny 
-                    j2 =  self.ny - 1   
-                    a2 =  j2  + i * self.ny 
-                    print("**Comparing the images %d %d " %(a1,a2)) 
-                    SetGlobalVerticalShift(self.images[a1], self.images[a2], lx)
-                
-            if i%2 == 0:
-                for j in range(self.ny - 1):
-                    a =  j + i * self.ny 
-                    a1 = a
-                    a2 = a + 1
-                    print("**Comparing the images %d %d " %(a1,a2)) 
-                    SetGlobalHorizontalShift(self.images[a1], self.images[a2], ly )
-            else: 
-                for j in range(self.ny - 1, 0, -1):
-                    a =  j  + i * self.ny 
-                    a1 = a
-                    a2 = a - 1 
-                    print("**Comparing the images %d %d " %(a1,a2)) 
-                    SetGlobalHorizontalShift(self.images[a1], self.images[a2], ly )
+        # Process rows: compare left-right neighbors
+        for row in range(self.ny):
+            print(f"Row {row}")
+            for col in range(self.nx - 1):
+                idx_left = row * self.nx + col
+                idx_right = row * self.nx + col + 1
+                print(f"  Comparing images {idx_left} and {idx_right}")
+                SetGlobalHorizontalShift(self.images[idx_left], self.images[idx_right], ly)
+        
+        # Process columns: compare top-bottom neighbors
+        for col in range(self.nx):
+            print(f"Column {col}")
+            for row in range(self.ny - 1):
+                idx_top = row * self.nx + col
+                idx_bottom = (row + 1) * self.nx + col
+                print(f"  Comparing images {idx_top} and {idx_bottom}")
+                SetGlobalVerticalShift(self.images[idx_top], self.images[idx_bottom], lx)
                     
 

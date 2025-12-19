@@ -1,7 +1,7 @@
 from classBilinearInterpolator import BiLinearRegularGridInterpolator 
 import scipy.interpolate as spi
 import cv2 as cv
-from   scipy.ndimage import gaussian_filter
+from   scipy.ndimage import gaussian_filter, spline_filter
 import numpy as np 
 import PIL.Image as image
 import matplotlib.pyplot as plt 
@@ -18,6 +18,7 @@ class Image:
         self.txr = None # Relative shift to upper image  
         self.tyr = None # Relative shift to left image  
         self.pix = None 
+        self.pix_prefiltered = None  # cached spline-filtered image for map_coordinates
         
     
     def SetCoordinates(self,tx,ty):
@@ -54,6 +55,7 @@ class Image:
                 # self.pix = image.imread(self.fname).astype(float)
             if len(self.pix.shape) == 3:
                 self.ToGray()
+            self.pix_prefiltered = None
         else:
             print("File "+self.fname+" not in directory "+os.getcwd())
         return self
@@ -64,6 +66,7 @@ class Image:
             self.pix = cv.imread(self.fname).astype(float)
             if len(self.pix.shape) == 3:
                 self.ToGray()
+            self.pix_prefiltered = None
         else:
             print("File "+self.fname+" not in directory "+os.getcwd())
         return self
@@ -72,6 +75,7 @@ class Image:
         """Image Copy"""
         newimg = Image("Copy")
         newimg.pix = self.pix.copy()
+        newimg.pix_prefiltered = None
         return newimg
 
     def Save(self, fname):
@@ -87,6 +91,7 @@ class Image:
         self.interpMethod = method 
         if method == 'cubic-spline':
             self.tck = spi.RectBivariateSpline(x, y, self.pix, kx=3, ky=3)
+            self.pix_prefiltered = None
         if method == 'bilinear':
             self.interp = BiLinearRegularGridInterpolator()
         if method == 'linear':
@@ -165,6 +170,7 @@ class Image:
         sigma : float
             variance of the Gauss filter."""
         self.pix = gaussian_filter(self.pix, sigma)
+        self.pix_prefiltered = None
 
     def PlotHistogram(self):
         """Plot Histogram of graylevels"""
@@ -186,6 +192,7 @@ class Image:
         )
         nn[1] = nn[1] // scale
         self.pix = im0.reshape(nn)
+        self.pix_prefiltered = None
 
     def ToGray(self, type="lum"):
         """Convert RVG to Grayscale :
@@ -210,4 +217,9 @@ class Image:
             )
         else:
             self.pix = np.mean(self.pix, axis=2)
+        self.pix_prefiltered = None
+
+    def BuildSplinePrefilter(self, order=3):
+        """Cache spline-filtered pixels for fast map_coordinates with prefilter=False."""
+        self.pix_prefiltered = spline_filter(self.pix, order=order)
  

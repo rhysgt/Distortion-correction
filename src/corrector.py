@@ -3,474 +3,360 @@ from classImage import Image
 from classGrid import Grid
 from classProjector import Projector
 import numpy as np  
-import scipy as sp 
+import scipy as sp
+import os
+import re
+from pathlib import Path
+from PIL import Image as PILImage
  
 
-def ReadFijiLog(file):
-    """ Reads the Fiji modified log 
-    in order to get the correlation score on 
-    each overlapping region 
+def parse_field_filename(filename):
     """
-    Rfile = open(file)  
-    line = Rfile.readline()
-    k = 1 
-    # print(k,line)
-    R = [] 
-    while len(line)!=0:
-        # Extract the correlation coefficient 
-        s1 = '='
-        s2 = '('
-        # print(k,line)
-        i1 = line.index(s1)
-        i2 = line.index(s2,i1+1) 
-        Rs = line[i1+1:i2-1]
-        R.append(float(Rs))
-        k+=1
-        line = Rfile.readline()
-    return np.array(R)
+    Parse tile position from filename format: Field_YY_XX.tif
+    
+    Parameters
+    ----------
+    filename : str
+        Filename to parse (e.g., 'Field_12_18.tif' = row 12, column 18)
+    
+    Returns
+    -------
+    tuple or None
+        (y, x) position as integers (0-indexed), or None if pattern doesn't match
+    """
+    match = re.match(r'^(?:Field)_(\d+)_(\d+)\.(?:tif|tiff)$', filename, flags=re.IGNORECASE)
+    if match:
+        y, x = int(match.group(1)), int(match.group(2))
+        return (y, x)
+    return None
+
+
+def auto_detect_grid_config(directory):
+    """
+    Automatically detect grid configuration from Field_YY_XX.tif files.
+    
+    Parameters
+    ----------
+    directory : str or Path
+        Directory containing the tile images
+    
+    Returns
+    -------
+    dict
+        Configuration dictionary with:
+        - 'nx': number of tiles in x direction
+        - 'ny': number of tiles in y direction
+        - 'sx': image width in pixels
+        - 'sy': image height in pixels
+        - 'tiles': list of (y, x, filename) tuples sorted by position
+        - 'extension': '.tif'
+    
+    Raises
+    ------
+    ValueError
+        If no valid Field_YY_XX.tif files found or if images have inconsistent sizes
+    """
+    directory = Path(directory)
+    
+    # Find all matching files
+    tiles = []
+    for fname in os.listdir(directory):
+        pos = parse_field_filename(fname)
+        if pos is not None:
+            tiles.append((pos[0], pos[1], fname))
+    
+    if not tiles:
+        raise ValueError(f"No files matching Field_YY_XX.tif pattern found in {directory}")
+    
+    # Sort by position (y, then x)
+    tiles.sort(key=lambda t: (t[0], t[1]))
+    
+    # Determine grid dimensions
+    y_positions = set(t[0] for t in tiles)
+    x_positions = set(t[1] for t in tiles)
+    
+    ny = len(y_positions)
+    nx = len(x_positions)
+    
+    # Get image dimensions from first file
+    first_file = directory / tiles[0][2]
+    with PILImage.open(first_file) as img:
+        sx, sy = img.size
+    
+    print(f"Auto-detected grid configuration:")
+    print(f"  Grid size: {nx} x {ny} tiles")
+    print(f"  Image size: {sx} x {sy} pixels")
+    print(f"  Total tiles found: {len(tiles)}")
+    
+    return {
+        'nx': nx,
+        'ny': ny,
+        'sx': sx,
+        'sy': sy,
+        'tiles': tiles,
+        'extension': '.tif'
+    }
+
+
+def read_fiji_log(filepath):
+    """Read correlation scores from Fiji stitching log file.
+    
+    Parameters
+    ----------
+    filepath : str
+        Path to the Fiji log file
+    
+    Returns
+    -------
+    np.ndarray
+        Array of correlation coefficients from overlapping regions
+    """
+    scores = []
+    with open(filepath) as f:
+        for line in f:
+            if '=' in line and '(' in line:
+                # Extract value between '=' and '('
+                start = line.index('=') + 1
+                end = line.index('(', start)
+                scores.append(float(line[start:end].strip()))
+    return np.array(scores)
     
 
 
 def CreateGrid(input_param, images=None):
     """
-    Creates the grid object representing the image mosaic 
-    Input: - Directorty of images 
-           - input_param directory  
+    Creates the grid object representing the image mosaic.
+    
+    Parameters
+    ----------
+    input_param : dict
+        Dictionary of configuration parameters
+    images : list, optional
+        Pre-loaded images (default: None)
+    Note: Always uses auto-detected Field_YY_XX.tif tiles in input_param['dire'].
+    
+    Returns
+    -------
+    Grid
+        Grid object containing images and regions
     """
-    A                    = input_param['A']
-    nex                  = input_param['nex']
-    ney                  = input_param['ney'] 
-    extension            = input_param['extension'] 
-    ox                   = input_param['ox']
-    oy                   = input_param['oy']
-    sigma_gaussian       = input_param['sigma_gaussian']   
-    interpolation        = input_param['interpolation']
-    sx                   = input_param['sx']    
-    sy                   = input_param['sy']
-    dire                 = input_param['dire']
-    file_name0           = input_param['file_name0']
-    file_name1           = input_param['file_name1'] 
-    ndigits              = input_param['ndigits']
-    nx                   = input_param['nx']
-    ny                   = input_param['ny']
-    
-    """ Reading the images """ 
- 
-    iy = int ( np.ceil(A/ny) )   
-    ix = int ( iy%2*(A-(iy-1)*ny) + (iy-1)%2*(ny+1+(iy-1)*ny-A) ) 
- 
-    
-    a_list  = np.zeros(nex*ney,dtype='int')
-    iy_list = np.zeros(nex*ney,dtype='int') 
-    ix_list = np.zeros(nex*ney,dtype='int')
-    
-    k  = 1 
-    kk = 0
-    if iy%2 ==0:
-        for i in range(iy,iy+nex):
-            if i%2 == 0  :
-                for j in range(ix,ix+ney):
-                    xn = j
-                    yn = i
-                    a = int( yn%2*(xn+(yn-1)*ny) +  (yn-1)%2*( (ny-xn+1) + (yn-1)*ny ) ) 
-                    a_list[kk]  = a
-                    iy_list[kk] = i 
-                    ix_list[kk] = j
-                    k+=1 
-                    kk+=1
-            else: 
-                for j in range(ix+ney-1,ix-1,-1):
-                    xn = j
-                    yn = i
-                    a = int( yn%2*(xn+(yn-1)*ny) +  (yn-1)%2*( (ny-xn+1) + (yn-1)*ny ) ) 
-                    a_list[kk]  = a
-                    iy_list[kk] = i
-                    ix_list[kk] = j
-                    k+=1 
-                    kk+=1
-    else :           
-        for i in range(iy,iy+nex):
-            if i%2 == 0  : 
-                for j in range(ix+ney-1,ix-1,-1):
-                    xn = j
-                    yn = i
-                    a = int( yn%2*(xn+(yn-1)*ny) +  (yn-1)%2*( (ny-xn+1) + (yn-1)*ny ) ) 
-                    a_list[kk]  = a
-                    iy_list[kk] = i
-                    ix_list[kk] = j
-                    k+=1 
-                    kk+=1
-            else: 
-                for j in range(ix,ix+ney):
-                    xn = j
-                    yn = i
-                    a = int( yn%2*(xn+(yn-1)*ny) +  (yn-1)%2*( (ny-xn+1) + (yn-1)*ny ) ) 
-                    a_list[kk]  = a
-                    iy_list[kk] = i
-                    ix_list[kk] = j
-                    k+=1 
-                    kk+=1 
-                    
-    """ Setting the initial translations   """
-    first_time = False 
-    if images is None: 
-        first_time = True 
-        images = [None]*nex*ney 
-        
-    
-    for i in range(nex*ney):
-        if first_time :
-            a = a_list[i]  
-            images[i] = Image(dire + file_name0 + ("%0" +str(ndigits) + "d") % (a) + file_name1 + extension ) 
-            images[i].Load() 
-            ix = ix_list[i]
-            iy = iy_list[i]
-            tx = (ix-1) * np.floor( sy - sy*oy/100)
-            ty = (iy-1) * np.floor( sx - sx*ox/100)
-            images[i].SetCoordinates(ty,tx)
-            images[i].SetIndices(iy-1,ix-1)   
-        images[i].Load() 
-        images[i].GaussianFilter(sigma=sigma_gaussian)
-        images[i].BuildInterp(method=interpolation)
-        # print('Image'+str(i)+','+str(iy-1)+','+str(ix-1)+','+' ty,tx='+str(images[i].ty)+','+str(images[i].tx))    
-            
-    tx0 = images[0].tx 
-    ty0 = images[0].ty 
-    for im in images: 
-        im.SetCoordinates(im.tx-tx0,im.ty-ty0)        
-        # print(' ty,tx='+str(im.ty)+','+str(im.tx))    
- 
 
- 
-    regions = [None]* ( nex*(ney-1) + (nex-1)*ney )
-    """ Setting the initial overlaps """ 
-    k = 0 
-    for ix in range(nex):
-        for iy in range(ney-1):
-            # Setting the horizontal overlaps between image (ix,jx) and (ix,jx+1)
-            
-            # Left  (reference) image 
-            xn = iy + 1
-            yn = ix + 1
-            a0  = int( yn%2*(xn+(yn-1)*ney) +  (yn-1)%2*( (ney-xn+1) + (yn-1)*ney ) ) 
-            
-            # Right (deformed) image 
-            xn = iy + 2 
-            yn = ix + 1 
-            a1  = int( yn%2*(xn+(yn-1)*ney) +  (yn-1)%2*( (ney-xn+1) + (yn-1)*ney ) )
-            
-            regions[k] = Region((images[a0-1], images[a1-1]),(a0-1,a1-1),'v')
-            k +=1  
-    # Horizontal overlaps
-    for iy in range(ney):
-        for ix in range(nex-1):
-            # Setting the vertical overlaps between image (ix,jx) and (ix+1,jx)
+    if 'tiles' not in input_param:
+        config = auto_detect_grid_config(input_param['dire'])
+        input_param.update(config)
     
-            # Top (reference) image 
-            xn = iy + 1
-            yn = ix + 1
-            a0  = int( yn%2*(xn+(yn-1)*ney) +  (yn-1)%2*( (ney-xn+1) + (yn-1)*ney ) ) 
-            
-            # Bottom (deformed) image         
-            xn = iy + 1
-            yn = ix + 2
-            a1  = int( yn%2*(xn+(yn-1)*ney) +  (yn-1)%2*( (ney-xn+1) + (yn-1)*ney ) )
-            
-            regions[k] = Region((images[a0-1], images[a1-1]),(a0-1,a1-1),'h')
-            k+=1
+    # Extract parameters
+    nx = input_param['nx']  # number of columns in full grid
+    ny = input_param['ny']  # number of rows in full grid
+    
+    # Default to processing full grid: nex=rows, ney=cols
+    nrows = input_param.get('nex', ny)
+    ncols = input_param.get('ney', nx)
+    
+    ox = input_param['ox']
+    oy = input_param['oy']
+    sigma_gaussian = input_param['sigma_gaussian']
+    interpolation = input_param['interpolation']
+    sx = input_param['sx']
+    sy = input_param['sy']
+    dire = input_param['dire']
+    
+    tiles_dict = {(t[0], t[1]): t[2] for t in input_param['tiles']}
+    
+    # Load and prepare images in row-major order
+    first_time = images is None
+    if first_time:
+        images = [None] * (nrows * ncols)
+
+    idx = 0
+    for row in range(nrows):
+        for col in range(ncols):
+            if first_time:
+                filename = tiles_dict.get((row, col))
+                if filename is None:
+                    raise ValueError(f"Missing tile at position ({row}, {col}). Expected Field_{row}_{col}.tif")
+                
+                images[idx] = Image(dire + filename)
+                tx = col * np.floor(sy - sy * oy / 100)  # x offset per column
+                ty = row * np.floor(sx - sx * ox / 100)  # y offset per row
+                images[idx].SetCoordinates(ty, tx)
+                images[idx].SetIndices(row, col)
+
+            images[idx].Load()
+            images[idx].GaussianFilter(sigma=sigma_gaussian)
+            images[idx].BuildInterp(method=interpolation)
+            idx += 1
+
+    # Normalize coordinates to start from (0, 0)
+    tx0, ty0 = images[0].tx, images[0].ty
+    for im in images:
+        im.SetCoordinates(im.tx - tx0, im.ty - ty0)
+
+    # Build regions: horizontal (left-right) and vertical (top-bottom) overlaps
+    regions = []
+    for row in range(nrows):
+        for col in range(ncols - 1):
+            left = row * ncols + col
+            right = row * ncols + col + 1
+            regions.append(Region((images[left], images[right]), (left, right), 'v'))
+    
+    for col in range(ncols):
+        for row in range(nrows - 1):
+            top = row * ncols + col
+            bottom = (row + 1) * ncols + col
+            regions.append(Region((images[top], images[bottom]), (top, bottom), 'h'))
     
     grid = Grid((nx,ny),(ox,oy),(sx,sy),images,regions)
     return grid 
             
  
-def DistortionAdjustment(input_param, cam, images, epsilon=0 ): 
+def DistortionAdjustment(input_param, cam, images, epsilon=0): 
+    """Identify the distortion function using Gauss-Newton optimization.
+    
+    Parameters
+    ----------
+    input_param : dict
+        Configuration parameters
+    cam : Projector or None
+        Initial projector/camera model
+    images : list or None
+        Pre-loaded images
+    epsilon : float, optional
+        Cropping parameter for reducing overlapping regions (default: 0)
+    
+    Returns
+    -------
+    tuple
+        (cam, images, grid, res_tot): Updated camera model, images, grid, and residuals
     """
-    Identifies the distortion function 
-    Takes as input 
-    An initial projector cam 
-    The set of images 
-    epsilon is a croping parameter in order to reducing the overlapping regions 
-    """
-    # etting the registration parameters 
-    A                    = input_param['A']
-    nex                  = input_param['nex']
-    ney                  = input_param['ney'] 
-    extension            = input_param['extension'] 
-    ox                   = input_param['ox']
-    oy                   = input_param['oy']
-    sigma_gaussian       = input_param['sigma_gaussian']   
-    subsampling          = input_param['subsampling']
-    interpolation        = input_param['interpolation']
-    sx                   = input_param['sx']    
-    sy                   = input_param['sy']
-    Niter                = input_param['Niter']
-    tol                  = input_param['tol']
-    modes                = input_param['modes']
-    mx                   = input_param['mx']
-    my                   = input_param['my']
-    d0                   = input_param['d0']
-    if d0 is None: 
-        d0 = np.zeros(len(mx)+len(my))
-
-    dire                 = input_param['dire']
-    file_name0           = input_param['file_name0']
-    file_name1           = input_param['file_name1']
-    ndigits              = input_param['ndigits']
-    nx                   = input_param['nx']
-    ny                   = input_param['ny']
- 
- 
-    """ Reading the images """ 
- 
-    iy = int ( np.ceil(A/ny) )   
-    ix = int ( iy%2*(A-(iy-1)*ny) + (iy-1)%2*(ny+1+(iy-1)*ny-A) ) 
- 
-    a_list  = np.zeros(nex*ney,dtype='int')
-    iy_list = np.zeros(nex*ney,dtype='int') 
-    ix_list = np.zeros(nex*ney,dtype='int')
+    # Create grid (auto-detects tiles if not already loaded)
+    grid = CreateGrid(input_param, images=images)
     
-    k  = 1 
-    kk = 0
-    if iy%2 ==0:
-        for i in range(iy,iy+nex):
-            if i%2 == 0  :
-                for j in range(ix,ix+ney):
-                    xn = j
-                    yn = i
-                    a = int( yn%2*(xn+(yn-1)*ny) +  (yn-1)%2*( (ny-xn+1) + (yn-1)*ny ) ) 
-                    a_list[kk]  = a
-                    iy_list[kk] = i 
-                    ix_list[kk] = j
-                    k+=1 
-                    kk+=1
-            else: 
-                for j in range(ix+ney-1,ix-1,-1):
-                    xn = j
-                    yn = i
-                    a = int( yn%2*(xn+(yn-1)*ny) +  (yn-1)%2*( (ny-xn+1) + (yn-1)*ny ) ) 
-                    a_list[kk]  = a
-                    iy_list[kk] = i
-                    ix_list[kk] = j
-                    k+=1 
-                    kk+=1
-    else :           
-        for i in range(iy,iy+nex):
-            if i%2 == 0  : 
-                for j in range(ix+ney-1,ix-1,-1):
-                    xn = j
-                    yn = i
-                    a = int( yn%2*(xn+(yn-1)*ny) +  (yn-1)%2*( (ny-xn+1) + (yn-1)*ny ) ) 
-                    a_list[kk]  = a
-                    iy_list[kk] = i
-                    ix_list[kk] = j
-                    k+=1 
-                    kk+=1
-            else: 
-                for j in range(ix,ix+ney):
-                    xn = j
-                    yn = i
-                    a = int( yn%2*(xn+(yn-1)*ny) +  (yn-1)%2*( (ny-xn+1) + (yn-1)*ny ) ) 
-                    a_list[kk]  = a
-                    iy_list[kk] = i
-                    ix_list[kk] = j
-                    k+=1 
-                    kk+=1 
-   
-                    
-    """ Setting the initial translations   """
-    first_time = False 
-    if images is None: 
-        first_time = True 
-        images = [None]*nex*ney 
-        
+    # Extract parameters
+    subsampling = input_param['subsampling']
+    sx = input_param['sx']
+    sy = input_param['sy']
+    Niter = input_param['Niter']
+    tol = input_param['tol']
+    modes = input_param['modes']
+    mx = input_param['mx']
+    my = input_param['my']
+    d0 = input_param.get('d0')
+    if d0 is None:
+        d0 = np.zeros(len(mx) + len(my))
     
-    for i in range(nex*ney):
-        if first_time :
-            a = a_list[i]  
-            images[i] = Image(dire + file_name0 + ("%0" +str(ndigits) + "d") % (a) + file_name1 + extension ) 
-            images[i].Load() 
-            ix = ix_list[i]
-            iy = iy_list[i]
-            tx = (ix-1) * np.floor( sy - sy*oy/100)
-            ty = (iy-1) * np.floor( sx - sx*ox/100)
-            images[i].SetCoordinates(ty,tx)
-            images[i].SetIndices(iy-1,ix-1)   
-        images[i].Load() 
-        images[i].GaussianFilter(sigma=sigma_gaussian)
-        images[i].BuildInterp(method=interpolation)
-        # print('Image'+str(i)+','+str(iy-1)+','+str(ix-1)+','+' ty,tx='+str(images[i].ty)+','+str(images[i].tx))    
-            
-    tx0 = images[0].tx 
-    ty0 = images[0].ty 
-    for im in images: 
-        im.SetCoordinates(im.tx-tx0,im.ty-ty0)        
-        # print(' ty,tx='+str(im.ty)+','+str(im.tx))    
- 
-
- 
-    regions = [None]* ( nex*(ney-1) + (nex-1)*ney )
-    """ Setting the initial overlaps """ 
-    k = 0 
-    for ix in range(nex):
-        for iy in range(ney-1):
-            # Setting the horizontal overlaps between image (ix,jx) and (ix,jx+1)
-            
-            # Left  (reference) image 
-            xn = iy + 1
-            yn = ix + 1
-            a0  = int( yn%2*(xn+(yn-1)*ney) +  (yn-1)%2*( (ney-xn+1) + (yn-1)*ney ) ) 
-            
-            # Right (deformed) image 
-            xn = iy + 2 
-            yn = ix + 1 
-            a1  = int( yn%2*(xn+(yn-1)*ney) +  (yn-1)%2*( (ney-xn+1) + (yn-1)*ney ) )
-            
-            regions[k] = Region((images[a0-1], images[a1-1]),(a0-1,a1-1),'v')
-            k +=1  
-    # Horizontal overlaps
-    for iy in range(ney):
-        for ix in range(nex-1):
-            # Setting the vertical overlaps between image (ix,jx) and (ix+1,jx)
+    im_list = grid.images
+    r_list = grid.regions
     
-            # Top (reference) image 
-            xn = iy + 1
-            yn = ix + 1
-            a0  = int( yn%2*(xn+(yn-1)*ney) +  (yn-1)%2*( (ney-xn+1) + (yn-1)*ney ) ) 
-            
-            # Bottom (deformed) image         
-            xn = iy + 1
-            yn = ix + 2
-            a1  = int( yn%2*(xn+(yn-1)*ney) +  (yn-1)%2*( (ney-xn+1) + (yn-1)*ney ) )
-            
-            regions[k] = Region((images[a0-1], images[a1-1]),(a0-1,a1-1),'h')
-            k+=1
-
- 
-    im_list = images 
-    r_list  = regions
+    # Track residuals across iterations
+    Res = np.ones((len(r_list), Niter)) * np.nan
     
-    # We plot the evolution of the correlation score 
-    # during the iterations and this for all the overlapping regions 
-    Res = np.ones((len(r_list),Niter))*np.nan 
-    
-    # Vector containing the translations of the images
-    # [tx0,ty0,...,txn,tyn]  
-    # Connectivity between images and the translation vector 
-    # constant, x, y, xy, x², y², x²y, xy², x³, y³ 
-
-    
-    if first_time : 
-        
-        cam  = Projector(d0, sx/2, sy/2, mx, my, sx, sy)
-        
-        if modes == 't':
-            p0 = d0
-            for im in im_list:
-                p0 = np.r_[p0,im.tx,im.ty] 
-                
-        elif modes == 't+d':
-            p0 = d0
-            for im in im_list:
-                p0 = np.r_[p0,im.tx,im.ty] 
-                
+    # Initialize camera and preallocate parameter vector
+    first_time = (images is None)
+    if first_time:
+        cam = Projector(d0, sx/2, sy/2, mx, my, sx, sy)
+        if modes in ('t', 't+d'):
+            # Vectorized initialization: [d0, tx_0, ty_0, ..., tx_n, ty_n]
+            p = np.concatenate([d0, np.array([[im.tx, im.ty] for im in im_list]).ravel()])
         elif modes == 'd':
-            p0 = d0 
-            
+            p = d0.copy()
         else:
-            raise ValueError('Error')        
-        p = p0
- 
+            raise ValueError(f"Unknown mode: {modes}. Must be 't', 'd', or 't+d'.")
     else:
-        p = cam.p 
-        for im in im_list:
-            p = np.r_[p,im.tx,im.ty] 
-        
-
+        if modes in ('t', 't+d'):
+            p = np.concatenate([cam.p, np.array([[im.tx, im.ty] for im in im_list]).ravel()])
+        else:
+            p = cam.p.copy()
     
-    grid = Grid((nx,ny),(ox,oy),(sx,sy),im_list,r_list)
-    
-    nd   = len(cam.p) 
-    conn = np.arange(2*len(im_list)).reshape((-1,2)) + nd 
+    nd = len(cam.p)
+    conn = np.arange(2 * len(im_list)).reshape((-1, 2)) + nd
     grid.Connectivity(conn)
     
-    # grid.ReadTile(dire+'tile_corrected_sigma=0.8.txt')
-    
-        
+    # Select parameters to optimize based on mode (compute once)
     if modes == 't':
-        rep  = grid.conn[:,:].ravel()
-    elif modes == 't+d': 
-        rep  =  np.r_[ np.arange(nd), grid.conn[:,:].ravel() ]
-    elif modes == 'd':  
-        rep  =  np.arange(nd)
+        rep = grid.conn[:, :].ravel()
+    elif modes == 't+d':
+        rep = np.r_[np.arange(nd), grid.conn[:, :].ravel()]
+    elif modes == 'd':
+        rep = np.arange(nd)
     
-    # grid.ReadTile(dire+'TileConfiguration.registered.txt')
-    # grid.ReadTile(dire+'TileCorrector.txt')
-    
+    # Gauss-Newton optimization iterations
     print('--GN')
+    
     for ik in range(Niter):
-        
-        # Updating the positions of the overlapping regions 
-        for r in grid.regions:
+        # Update overlapping region positions
+        for r in r_list:
             r.SetBounds(epsilon)
-            r.IntegrationPts(s=subsampling)  
+            r.IntegrationPts(s=subsampling)
         
-        H,b,res_tot = grid.GetOps(cam) 
-     
-            
-        repk = np.ix_(rep,rep) 
-        Hk = H[repk]
+        H, b, res_tot = grid.GetOps(cam)
+        
+        # Solve for parameter updates on selected subset
+        Hk = H[np.ix_(rep, rep)]
         bk = b[rep]
-        
-        # Hkinv = np.linalg.inv(Hk)
-        # return Hkinv 
-        # raise ValueError('Stop')
-        
-     
         dp = np.linalg.solve(Hk, bk)
-        p[rep]  += dp 
-     
-    
-        """ Updating""" 
-        # Updating the translation of the im_list 
-        for i,im in enumerate(im_list):
-            im.SetCoordinates(p[grid.conn[i,0]], p[grid.conn[i,1]]) 
-                  
-        # Updating the distortion parameters 
-        if modes == 't+d' or modes == 'd':
-            cam.p = p[:nd] 
+        p[rep] += dp
         
-    
-        err = np.linalg.norm(dp)/np.linalg.norm(p)
-        print('----------------------------------------')
-        print("Iter # %2d | dp/p=%1.2e" % (ik + 1, err)) 
-        for i,r in enumerate(r_list):
-            # print("Region # %2d |s=%2.2f" % (i+1,np.std(res_tot[i])) )
-            Res[i,ik] = np.std(res_tot[i]) 
-        print('Mean residual std on regions: %2.2f' % np.mean(Res[:,ik]) )
-        print('Std residual std on regions: %2.2f' % np.std(Res[:,ik]))
-        print('Maximal residual std on regions: %2.2f '% np.max(Res[:,ik]))
-        print('Minimal residual std on regions: %2.2f '% np.min(Res[:,ik]))
-
-        print('----------------------------------------')
+        # Update image translations and distortion parameters
+        for i, im in enumerate(im_list):
+            im.SetCoordinates(p[conn[i, 0]], p[conn[i, 1]])
+        if modes in ('t+d', 'd'):
+            cam.p = p[:nd]
         
+        # Check convergence
+        err = np.linalg.norm(dp) / np.linalg.norm(p)
 
-            
+        residual_stds = np.array([np.std(res_tot[i]) for i in range(len(r_list))])
+        Res[:, ik] = residual_stds
+        print(f"Iter # {ik + 1:2d} | dp/p={err:1.2e} | "
+                f"mean_std={np.mean(residual_stds):.2f}, "
+                f"max_std={np.max(residual_stds):.2f}")
+        
         if err < tol:
             break
         
     return cam, images, grid, res_tot  
 
 
-def DistortionAdjustement_Multiscale(parameters, cam0=None, images0=None, epsilon=0): 
-    for i in range(len(parameters['subsampling_scales'])):
-        print('*********** SCALE '+str(i+1)+' ***********')
-        parameters['interpolation']   = parameters['interpolation_scales'][i]
-        parameters['subsampling']     = parameters['subsampling_scales'][i]
-        parameters['sigma_gaussian']  = parameters['sigma_gauss_scales'][i]
-        parameters['Niter']           = parameters['Niter_scales'][i]
-        cam, images, grid, res_tot    = DistortionAdjustment(parameters, cam0, images0, epsilon) 
-        cam0              =  cam     
-        images0           =  images 
+def DistortionAdjustement_Multiscale(parameters, cam0=None, images0=None, epsilon=0):
+    """Multi-scale distortion adjustment procedure.
+    
+    Processes the mosaic at multiple resolution scales (coarse to fine)
+    to improve convergence and robustness.
+    
+    Parameters
+    ----------
+    parameters : dict
+        Configuration parameters with scale-specific settings:
+        - interpolation_scales, subsampling_scales, sigma_gauss_scales, Niter_scales
+    cam0 : Projector, optional
+        Initial camera/projector model
+    images0 : list, optional
+        Pre-loaded images
+    epsilon : float, optional
+        Cropping parameter for reducing overlapping regions (default: 0)
+    
+    Returns
+    -------
+    tuple
+        (cam, images, grid, res_tot): Optimized camera model, images, grid, and residuals
+    """
+    cam, images = cam0, images0
+    
+    for i, (interp, subsample, sigma, niter) in enumerate(zip(
+        parameters['interpolation_scales'],
+        parameters['subsampling_scales'],
+        parameters['sigma_gauss_scales'],
+        parameters['Niter_scales']
+    )):
+        print(f'*********** SCALE {i + 1} ***********')
+        parameters['interpolation'] = interp
+        parameters['subsampling'] = subsample
+        parameters['sigma_gaussian'] = sigma
+        parameters['Niter'] = niter
+        
+        cam, images, grid, res_tot = DistortionAdjustment(parameters, cam, images, epsilon)
+    
     return cam, images, grid, res_tot 
 
 

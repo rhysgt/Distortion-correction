@@ -1,4 +1,6 @@
 from classProjector import Projector
+from classImage import Image
+from classRegion import Region
 import skimage                   
 from multiprocessing import Pool 
 import concurrent.futures
@@ -6,7 +8,10 @@ import matplotlib.pyplot as plt
 import numpy as np 
 import skimage
 import pathlib
-import datetime
+import os
+import re
+from pathlib import Path
+from PIL import Image as PILImage
 from scipy.ndimage import map_coordinates 
 
 
@@ -100,7 +105,172 @@ class Grid:
         Sets the vector that selects the modes and translation in the 
         toral Degree of Freedom vector
         """
-        self.conn = conn 
+        self.conn = conn
+    
+    @staticmethod
+    def parse_field_filename(filename):
+        """
+        Parse tile position from filename format: Field_YY_XX.tif
+        
+        Parameters
+        ----------
+        filename : str
+            Filename to parse (e.g., 'Field_12_18.tif' = row 12, column 18)
+        
+        Returns
+        -------
+        tuple or None
+            (y, x) position as integers (0-indexed), or None if pattern doesn't match
+        """
+        match = re.match(r'^(?:Field)_(\d+)_(\d+)\.(?:tif|tiff)$', filename, flags=re.IGNORECASE)
+        if match:
+            y, x = int(match.group(1)), int(match.group(2))
+            return (y, x)
+        return None
+    
+    @staticmethod
+    def auto_detect_grid_config(directory):
+        """
+        Automatically detect grid configuration from Field_YY_XX.tif files.
+        
+        Parameters
+        ----------
+        directory : str or Path
+            Directory containing the tile images
+        
+        Returns
+        -------
+        dict
+            Configuration dictionary with grid dimensions and tile info
+        
+        Raises
+        ------
+        ValueError
+            If no valid Field_YY_XX.tif files found
+        """
+        directory = Path(directory)
+        
+        # Find all matching files
+        tiles = []
+        for fname in os.listdir(directory):
+            pos = Grid.parse_field_filename(fname)
+            if pos is not None:
+                tiles.append((pos[0], pos[1], fname))
+        
+        if not tiles:
+            raise ValueError(f"No files matching Field_YY_XX.tif pattern found in {directory}")
+        
+        # Sort by position (y, then x)
+        tiles.sort(key=lambda t: (t[0], t[1]))
+        
+        # Determine grid dimensions
+        y_positions = set(t[0] for t in tiles)
+        x_positions = set(t[1] for t in tiles)
+        
+        ny = len(y_positions)
+        nx = len(x_positions)
+        
+        # Get image dimensions from first file
+        first_file = directory / tiles[0][2]
+        with PILImage.open(first_file) as img:
+            sx, sy = img.size
+        
+        print(f"Auto-detected grid configuration:")
+        print(f"  Grid size: {nx} x {ny} tiles")
+        print(f"  Image size: {sx} x {sy} pixels")
+        print(f"  Total tiles found: {len(tiles)}")
+        
+        return {
+            'nx': nx,
+            'ny': ny,
+            'sx': sx,
+            'sy': sy,
+            'tiles': tiles,
+            'extension': '.tif'
+        }
+    
+    @classmethod
+    def CreateGrid(cls, input_param, images=None):
+        """
+        Creates the grid object representing the image mosaic.
+        
+        Parameters
+        ----------
+        input_param : dict
+            Dictionary of configuration parameters
+        images : list, optional
+            Pre-loaded images (default: None)
+        
+        Returns
+        -------
+        Grid
+            Grid object containing images and regions
+        """
+        if 'tiles' not in input_param:
+            config = cls.auto_detect_grid_config(input_param['dire'])
+            input_param.update(config)
+        
+        # Extract parameters
+        nx = input_param['nx']  # number of columns
+        ny = input_param['ny']  # number of rows
+        nrows = input_param.get('nex', ny)
+        ncols = input_param.get('ney', nx)
+        
+        ox = input_param['ox']
+        oy = input_param['oy']
+        sigma_gaussian = input_param['sigma_gaussian']
+        interpolation = input_param['interpolation']
+        sx = input_param['sx']
+        sy = input_param['sy']
+        dire = input_param['dire']
+        
+        tiles_dict = {(t[0], t[1]): t[2] for t in input_param['tiles']}
+        
+        # Load and prepare images in row-major order
+        first_time = images is None
+        if first_time:
+            images = [None] * (nrows * ncols)
+
+        idx = 0
+        for row in range(nrows):
+            for col in range(ncols):
+                if first_time:
+                    filename = tiles_dict.get((row, col))
+                    if filename is None:
+                        raise ValueError(f"Missing tile at position ({row}, {col}). Expected Field_{row}_{col}.tif")
+                    
+                    images[idx] = Image(dire + filename)
+                    tx = col * np.floor(sy - sy * oy / 100)  # x offset per column
+                    ty = row * np.floor(sx - sx * ox / 100)  # y offset per row
+                    images[idx].SetCoordinates(ty, tx)
+                    images[idx].SetIndices(row, col)
+
+                images[idx].Load()
+                images[idx].GaussianFilter(sigma=sigma_gaussian)
+                images[idx].BuildInterp(method=interpolation)
+                idx += 1
+
+        # Normalize coordinates to start from (0, 0)
+        tx0, ty0 = images[0].tx, images[0].ty
+        for im in images:
+            im.SetCoordinates(im.tx - tx0, im.ty - ty0)
+
+        # Build regions
+        regions = []
+        for row in range(nrows):
+            for col in range(ncols - 1):
+                left = row * ncols + col
+                right = row * ncols + col + 1
+                regions.append(Region((images[left], images[right]), (left, right), 'v'))
+        
+        for col in range(ncols):
+            for row in range(nrows - 1):
+                top = row * ncols + col
+                bottom = (row + 1) * ncols + col
+                regions.append(Region((images[top], images[bottom]), (top, bottom), 'h'))
+        
+        grid = cls((nx, ny), (ox, oy), (sx, sy), images, regions)
+        return grid 
             
     
     def ExportTile(self, file):
@@ -145,8 +315,9 @@ class Grid:
         for im in self.images:
             im.PlotBox(origin,color)  
 
-    
-    def _process_blending_region(self, im, camc, xs_flat, ys_flat, origin, windowExt, sx_ims, sy_ims, sx_max, sy_max, ims, ws, is_overlap_fn, weight_fn):
+    def _process_blending_region(self, im, camc, xs_flat, ys_flat, origin, windowExt, 
+                                 sx_ims, sy_ims, sx_max, sy_max, 
+                                 ims, ws, is_overlap_fn, weight_fn, interpolation_order):
         """Helper for linear blending (reduces code duplication)"""
         im_tx, im_ty = im.tx, im.ty
         
@@ -180,23 +351,31 @@ class Grid:
         mask_overlap = is_overlap_fn(u_fov, v_fov)
 
         # Use cached spline-filtered pixels when available to avoid per-call prefiltering
-        pix_src = im.pix_prefiltered if getattr(im, "pix_prefiltered", None) is not None else im.pix
+        if interpolation_order > 1:
+            pix_src = im.pix_prefiltered if getattr(im, "pix_prefiltered", None) is not None else im.pix
+        else:
+            pix_src = im.pix
 
-        # Non-overlapping region (full weight)
-        mask_no = ~mask_overlap
-        if np.any(mask_no):
-            idx_no = idx_fov[mask_no]
-            ws[idx_no] += 1
-            ims[idx_no] += map_coordinates(pix_src, [u_fov[mask_no], v_fov[mask_no]], order=3, mode='constant', cval=0, prefilter=False)
-        
-        # Overlapping region with blending weight
+        # Build weights in one pass: 1 for non-overlap, blend weight for overlap
+        weights = np.ones_like(u_fov)
         if np.any(mask_overlap):
-            idx_o = idx_fov[mask_overlap]
-            w = weight_fn(u_fov[mask_overlap], v_fov[mask_overlap])
-            ws[idx_o] += w
-            ims[idx_o] += map_coordinates(pix_src, [u_fov[mask_overlap], v_fov[mask_overlap]], order=3, mode='constant', cval=0, prefilter=False) * w
+            weights[mask_overlap] = weight_fn(u_fov[mask_overlap], v_fov[mask_overlap])
+
+        # Single interpolation call for both overlap/non-overlap
+        sampled = map_coordinates(
+            pix_src,
+            [u_fov, v_fov],
+            order=interpolation_order,
+            mode='constant',
+            cval=0,
+            prefilter=False,
+        )
+
+        ws[idx_fov] += weights
+        ims[idx_fov] += sampled * weights
     
-    def StitchImages(self, cam=None, origin=(0,0), eps=(0,0), fusion_mode='linear blending'):
+    def StitchImages(self, cam=None, origin=(0,0), eps=(0,0), 
+                     interpolation_order=3, fusion_mode='linear blending'):
         """
         Stitch the grid into one image 
         """
@@ -211,9 +390,10 @@ class Grid:
             r.SetBounds(epsilon=0) 
 
         # Ensure each image has a cached spline-filtered version for fast map_coordinates
-        for im in self.images:
-            if getattr(im, "pix_prefiltered", None) is None:
-                im.BuildSplinePrefilter(order=3)
+        if interpolation_order > 1:
+            for im in self.images:
+                if getattr(im, "pix_prefiltered", None) is None:
+                    im.BuildSplinePrefilter(order = interpolation_order)
         
         # Compute fused image size once
         sx_ims = int(self.sx*self.nx - (self.nx-1)*np.floor(self.sx*self.ox/100))+eps[0]
@@ -245,7 +425,8 @@ class Grid:
                         r.im0, camc, xs_flat, ys_flat, origin, windowExt, 
                         sx_ims, sy_ims, sx_max, sy_max, ims, ws,
                         is_overlap_fn=lambda u, v, hy=r_hy, sy=sy_max: v > sy - hy,
-                        weight_fn=lambda u, v, hy=r_hy, sy=sy_max: (v - sy) / (-hy)
+                        weight_fn=lambda u, v, hy=r_hy, sy=sy_max: (v - sy) / (-hy),
+                        interpolation_order=interpolation_order
                     )
                     
                     # Right image im1 (increasing weight with v)
@@ -253,7 +434,8 @@ class Grid:
                         r.im1, camc, xs_flat, ys_flat, origin, windowExt,
                         sx_ims, sy_ims, sx_max, sy_max, ims, ws,
                         is_overlap_fn=lambda u, v, hy=r_hy: v <= hy,
-                        weight_fn=lambda u, v, hy=r_hy: v / hy
+                        weight_fn=lambda u, v, hy=r_hy: v / hy,
+                        interpolation_order=interpolation_order
                     )
                     
                 elif r.type == 'h':
@@ -265,7 +447,8 @@ class Grid:
                         r.im0, camc, xs_flat, ys_flat, origin, windowExt,
                         sx_ims, sy_ims, sx_max, sy_max, ims, ws,
                         is_overlap_fn=lambda u, v, hx=r_hx, sx=sx_max: u > sx - hx,
-                        weight_fn=lambda u, v, hx=r_hx, sx=sx_max: (u - sx) / (-hx)
+                        weight_fn=lambda u, v, hx=r_hx, sx=sx_max: (u - sx) / (-hx),
+                        interpolation_order=interpolation_order
                     )
                     
                     # Bottom image im1 (increasing weight with u)
@@ -273,7 +456,8 @@ class Grid:
                         r.im1, camc, xs_flat, ys_flat, origin, windowExt,
                         sx_ims, sy_ims, sx_max, sy_max, ims, ws,
                         is_overlap_fn=lambda u, v, hx=r_hx: u <= hx,
-                        weight_fn=lambda u, v, hx=r_hx: u / hx
+                        weight_fn=lambda u, v, hx=r_hx: u / hx,
+                        interpolation_order=interpolation_order
                     )
                 else:
                     raise ValueError('Unknown region type')
@@ -361,20 +545,16 @@ class Grid:
         
         # Process rows: compare left-right neighbors
         for row in range(self.ny):
-            print(f"Row {row}")
             for col in range(self.nx - 1):
                 idx_left = row * self.nx + col
                 idx_right = row * self.nx + col + 1
-                print(f"  Comparing images {idx_left} and {idx_right}")
                 SetGlobalHorizontalShift(self.images[idx_left], self.images[idx_right], ly)
         
         # Process columns: compare top-bottom neighbors
         for col in range(self.nx):
-            print(f"Column {col}")
             for row in range(self.ny - 1):
                 idx_top = row * self.nx + col
                 idx_bottom = (row + 1) * self.nx + col
-                print(f"  Comparing images {idx_top} and {idx_bottom}")
                 SetGlobalVerticalShift(self.images[idx_top], self.images[idx_bottom], lx)
                     
 

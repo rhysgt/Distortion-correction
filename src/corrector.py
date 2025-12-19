@@ -1,101 +1,7 @@
-from classRegion import Region 
-from classImage import Image
 from classGrid import Grid
 from classProjector import Projector
 import numpy as np  
 import scipy as sp
-import os
-import re
-from pathlib import Path
-from PIL import Image as PILImage
- 
-
-def parse_field_filename(filename):
-    """
-    Parse tile position from filename format: Field_YY_XX.tif
-    
-    Parameters
-    ----------
-    filename : str
-        Filename to parse (e.g., 'Field_12_18.tif' = row 12, column 18)
-    
-    Returns
-    -------
-    tuple or None
-        (y, x) position as integers (0-indexed), or None if pattern doesn't match
-    """
-    match = re.match(r'^(?:Field)_(\d+)_(\d+)\.(?:tif|tiff)$', filename, flags=re.IGNORECASE)
-    if match:
-        y, x = int(match.group(1)), int(match.group(2))
-        return (y, x)
-    return None
-
-
-def auto_detect_grid_config(directory):
-    """
-    Automatically detect grid configuration from Field_YY_XX.tif files.
-    
-    Parameters
-    ----------
-    directory : str or Path
-        Directory containing the tile images
-    
-    Returns
-    -------
-    dict
-        Configuration dictionary with:
-        - 'nx': number of tiles in x direction
-        - 'ny': number of tiles in y direction
-        - 'sx': image width in pixels
-        - 'sy': image height in pixels
-        - 'tiles': list of (y, x, filename) tuples sorted by position
-        - 'extension': '.tif'
-    
-    Raises
-    ------
-    ValueError
-        If no valid Field_YY_XX.tif files found or if images have inconsistent sizes
-    """
-    directory = Path(directory)
-    
-    # Find all matching files
-    tiles = []
-    for fname in os.listdir(directory):
-        pos = parse_field_filename(fname)
-        if pos is not None:
-            tiles.append((pos[0], pos[1], fname))
-    
-    if not tiles:
-        raise ValueError(f"No files matching Field_YY_XX.tif pattern found in {directory}")
-    
-    # Sort by position (y, then x)
-    tiles.sort(key=lambda t: (t[0], t[1]))
-    
-    # Determine grid dimensions
-    y_positions = set(t[0] for t in tiles)
-    x_positions = set(t[1] for t in tiles)
-    
-    ny = len(y_positions)
-    nx = len(x_positions)
-    
-    # Get image dimensions from first file
-    first_file = directory / tiles[0][2]
-    with PILImage.open(first_file) as img:
-        sx, sy = img.size
-    
-    print(f"Auto-detected grid configuration:")
-    print(f"  Grid size: {nx} x {ny} tiles")
-    print(f"  Image size: {sx} x {sy} pixels")
-    print(f"  Total tiles found: {len(tiles)}")
-    
-    return {
-        'nx': nx,
-        'ny': ny,
-        'sx': sx,
-        'sy': sy,
-        'tiles': tiles,
-        'extension': '.tif'
-    }
 
 
 def read_fiji_log(filepath):
@@ -122,95 +28,7 @@ def read_fiji_log(filepath):
     return np.array(scores)
     
 
-
-def CreateGrid(input_param, images=None):
-    """
-    Creates the grid object representing the image mosaic.
-    
-    Parameters
-    ----------
-    input_param : dict
-        Dictionary of configuration parameters
-    images : list, optional
-        Pre-loaded images (default: None)
-    Note: Always uses auto-detected Field_YY_XX.tif tiles in input_param['dire'].
-    
-    Returns
-    -------
-    Grid
-        Grid object containing images and regions
-    """
-
-    if 'tiles' not in input_param:
-        config = auto_detect_grid_config(input_param['dire'])
-        input_param.update(config)
-    
-    # Extract parameters
-    nx = input_param['nx']  # number of columns in full grid
-    ny = input_param['ny']  # number of rows in full grid
-    
-    # Default to processing full grid: nex=rows, ney=cols
-    nrows = input_param.get('nex', ny)
-    ncols = input_param.get('ney', nx)
-    
-    ox = input_param['ox']
-    oy = input_param['oy']
-    sigma_gaussian = input_param['sigma_gaussian']
-    interpolation = input_param['interpolation']
-    sx = input_param['sx']
-    sy = input_param['sy']
-    dire = input_param['dire']
-    
-    tiles_dict = {(t[0], t[1]): t[2] for t in input_param['tiles']}
-    
-    # Load and prepare images in row-major order
-    first_time = images is None
-    if first_time:
-        images = [None] * (nrows * ncols)
-
-    idx = 0
-    for row in range(nrows):
-        for col in range(ncols):
-            if first_time:
-                filename = tiles_dict.get((row, col))
-                if filename is None:
-                    raise ValueError(f"Missing tile at position ({row}, {col}). Expected Field_{row}_{col}.tif")
-                
-                images[idx] = Image(dire + filename)
-                tx = col * np.floor(sy - sy * oy / 100)  # x offset per column
-                ty = row * np.floor(sx - sx * ox / 100)  # y offset per row
-                images[idx].SetCoordinates(ty, tx)
-                images[idx].SetIndices(row, col)
-
-            images[idx].Load()
-            images[idx].GaussianFilter(sigma=sigma_gaussian)
-            images[idx].BuildInterp(method=interpolation)
-            idx += 1
-
-    # Normalize coordinates to start from (0, 0)
-    tx0, ty0 = images[0].tx, images[0].ty
-    for im in images:
-        im.SetCoordinates(im.tx - tx0, im.ty - ty0)
-
-    # Build regions: horizontal (left-right) and vertical (top-bottom) overlaps
-    regions = []
-    for row in range(nrows):
-        for col in range(ncols - 1):
-            left = row * ncols + col
-            right = row * ncols + col + 1
-            regions.append(Region((images[left], images[right]), (left, right), 'v'))
-    
-    for col in range(ncols):
-        for row in range(nrows - 1):
-            top = row * ncols + col
-            bottom = (row + 1) * ncols + col
-            regions.append(Region((images[top], images[bottom]), (top, bottom), 'h'))
-    
-    grid = Grid((nx,ny),(ox,oy),(sx,sy),images,regions)
-    return grid 
-            
- 
-def DistortionAdjustment(input_param, cam, images, epsilon=0): 
+def DistortionAdjustment(input_param, cam, images, grid=None, epsilon=0):
     """Identify the distortion function using Gauss-Newton optimization.
     
     Parameters
@@ -221,6 +39,8 @@ def DistortionAdjustment(input_param, cam, images, epsilon=0):
         Initial projector/camera model
     images : list or None
         Pre-loaded images
+    grid : Grid, optional
+        Pre-created grid (default: None, will auto-create)
     epsilon : float, optional
         Cropping parameter for reducing overlapping regions (default: 0)
     
@@ -229,8 +49,9 @@ def DistortionAdjustment(input_param, cam, images, epsilon=0):
     tuple
         (cam, images, grid, res_tot): Updated camera model, images, grid, and residuals
     """
-    # Create grid (auto-detects tiles if not already loaded)
-    grid = CreateGrid(input_param, images=images)
+    # Create grid if not provided (auto-detects tiles if not already loaded)
+    if grid is None:
+        grid = Grid.CreateGrid(input_param, images=images)
     
     # Extract parameters
     subsampling = input_param['subsampling']
@@ -318,7 +139,7 @@ def DistortionAdjustment(input_param, cam, images, epsilon=0):
     return cam, images, grid, res_tot  
 
 
-def DistortionAdjustement_Multiscale(parameters, cam0=None, images0=None, epsilon=0):
+def DistortionAdjustment_Multiscale(parameters, cam0=None, images0=None, grid0=None, epsilon=0):
     """Multi-scale distortion adjustment procedure.
     
     Processes the mosaic at multiple resolution scales (coarse to fine)
@@ -333,6 +154,8 @@ def DistortionAdjustement_Multiscale(parameters, cam0=None, images0=None, epsilo
         Initial camera/projector model
     images0 : list, optional
         Pre-loaded images
+    grid0 : Grid, optional
+        Pre-created grid (default: None, will auto-create)
     epsilon : float, optional
         Cropping parameter for reducing overlapping regions (default: 0)
     
@@ -341,7 +164,7 @@ def DistortionAdjustement_Multiscale(parameters, cam0=None, images0=None, epsilo
     tuple
         (cam, images, grid, res_tot): Optimized camera model, images, grid, and residuals
     """
-    cam, images = cam0, images0
+    cam, images, grid = cam0, images0, grid0
     
     for i, (interp, subsample, sigma, niter) in enumerate(zip(
         parameters['interpolation_scales'],
@@ -355,7 +178,7 @@ def DistortionAdjustement_Multiscale(parameters, cam0=None, images0=None, epsilo
         parameters['sigma_gaussian'] = sigma
         parameters['Niter'] = niter
         
-        cam, images, grid, res_tot = DistortionAdjustment(parameters, cam, images, epsilon)
+        cam, images, grid, res_tot = DistortionAdjustment(parameters, cam, images, grid, epsilon)
     
     return cam, images, grid, res_tot 
 
